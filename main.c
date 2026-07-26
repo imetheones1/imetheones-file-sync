@@ -128,6 +128,22 @@ void create_directories(const char* file_path) {
     }
 }
 
+void format_file_size(char *buffer, size_t buffer_size, double bytes) {
+    const char *units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+    int unit_index = 0;
+
+    while (bytes >= 1024 && unit_index < 5) {
+        bytes /= 1024;
+        unit_index++;
+    }
+
+    if (unit_index == 0) {
+        snprintf(buffer, buffer_size, "%.0f %s", bytes, units[unit_index]);
+    } else {
+        snprintf(buffer, buffer_size, "%.2f %s", bytes, units[unit_index]);
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         printf("usage:\n %s PATH COMMAND ...",argv[0]);
@@ -251,7 +267,9 @@ int main(int argc, char *argv[]) {
 
                 uint64_t file_size = s_file->size;
 
-                printf("Sending file %s (size %fkb)\n",s_file->path,(float)file_size/1000);
+                char filesize_text[32];
+                format_file_size(filesize_text,sizeof(filesize_text),file_size);
+                printf("Sending file %s (size %s)\n",s_file->path,filesize_text);
 
 
                 send(client_socket, (char*)&file_size, sizeof(file_size), 0);
@@ -333,6 +351,8 @@ int main(int argc, char *argv[]) {
         send(client_socket, (char*)&encoded_size, sizeof(size_t), 0);
         send(client_socket, (char*)encoded_buffer, encoded_size, 0);
 
+        size_t received_count = 0;
+
         uint64_t received_size;
         do {
             received_size = 0;
@@ -347,7 +367,9 @@ int main(int argc, char *argv[]) {
             char local_path[path_length + 1];
             receive(client_socket, local_path, path_length);
             local_path[path_length] = '\0';
-            printf("\nReceiving file %s (size %.2fkb)\n", local_path, (float)received_size/1000);
+            char filesize_text[32];
+            format_file_size(filesize_text,sizeof(filesize_text),received_size);
+            printf("\nReceiving file %s (size %s)\n",local_path,filesize_text);
             char full_path[MAX_PATH];
             snprintf(full_path, MAX_PATH, "%s\\%s", path, local_path);
             create_directories(full_path);
@@ -363,7 +385,10 @@ int main(int argc, char *argv[]) {
             printf("Success\n");
             uint8_t result = 0;
             send(client_socket, (char*)&result, sizeof(result), 0);
+            received_count++;
         } while (received_size > 0);
+
+        printf("\nSuccesfully received %zu files\n",received_count);
 
         shutdown(client_socket, SD_SEND);
         closesocket(client_socket);
