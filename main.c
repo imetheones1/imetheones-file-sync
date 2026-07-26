@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <winsock.h>
+#include <winsock2.h>
 #include <ws2tcpip.h>
 
 #include "manifest.h"
@@ -11,6 +12,35 @@
 #define port 2026 // todo choose a good port
 
 #define handle_winsock_error(res, function_name) do { if (res != 0) { printf(function_name " failed with code %d",res); WSACleanup(); return EXIT_FAILURE; }} while (0)
+
+int receive(SOCKET sock, char* buffer, size_t amount_to_read) {
+    size_t total_received = 0;
+
+    while (total_received < amount_to_read) {
+        size_t remaining = amount_to_read - total_received;
+        
+        // cap request size just in case
+        int request_size = (remaining > 2147483647) ? 2147483647 : (int)remaining;
+
+        int bytes_read = recv(sock, buffer + total_received, request_size, 0);
+
+        if (bytes_read > 0) {
+            total_received += bytes_read;
+        } 
+        else if (bytes_read == 0) {
+            // connection closed sucessfully, but not enough bytes
+            printf("Connection closed without reading full data\n");
+            return -1; 
+        } 
+        else {
+            // network error occured
+            printf("Failed to receive data with code %d\n",WSAGetLastError());
+            return -2; 
+        }
+    }
+
+    return 0; 
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
@@ -50,7 +80,7 @@ int main(int argc, char *argv[]) {
     handle_winsock_error(res, "WSAStartup");
 
     if (strncmp(command,"server",6) == 0) {
-        printf("server");
+        printf("server\n");
         SOCKET server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (server_socket == INVALID_SOCKET) {
             printf("Socket creation failed with code %d",WSAGetLastError());
@@ -64,7 +94,7 @@ int main(int argc, char *argv[]) {
             .sin_port = htons(port)
         };
         
-        res = bind(server_socket, &addr_in, sizeof(addr_in));
+        res = bind(server_socket, (struct sockaddr*)&addr_in, sizeof(addr_in));
         handle_winsock_error(res, "bind");
 
         res = listen(server_socket, SOMAXCONN);
@@ -80,8 +110,34 @@ int main(int argc, char *argv[]) {
         printf("Sucessfully established client connection\n");
 
         closesocket(server_socket);
+        size_t encoded_size = 0;
+        res = receive(client_socket, (char*)&encoded_size, sizeof(size_t));
+        if (res!=0) {
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+        printf("Manifest size: %zu\n",encoded_size);
+        uint8_t* manifest_buffer = malloc(encoded_size+5);
+        res = receive(client_socket, (char*)manifest_buffer, encoded_size);
+        if (res!=0) {
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+        Manifest* client_manifest = decode_manifest(manifest_buffer);
+        free(manifest_buffer);
+        if (!client_manifest) {
+            printf("Failed to decode manifest.\n");
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+        printf("%d\n",client_manifest->file_count);
+        for (uint32_t i = 0; i < client_manifest->file_count; i++) {
+            printf("%d. %s\n",i+1,client_manifest->records[i].path);
+        }
+        shutdown(client_socket, SD_SEND);
+        closesocket(client_socket);
     } else if (strncmp(command,"sync",4) == 0) {
-        printf("client");
+        printf("client\n");
         if (argc < 4) {
             printf("Usage: %s PATH sync ADDRESS");
             WSACleanup();
@@ -90,7 +146,48 @@ int main(int argc, char *argv[]) {
 
         char* address = argv[3];
 
-        // todo
+        SOCKET client_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (client_socket == INVALID_SOCKET) {
+            printf("Socket creation failed with code %d",WSAGetLastError());
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
+
+        struct sockaddr_in server_addr = { 
+            .sin_family = AF_INET, 
+            .sin_port = htons(port) 
+        };
+        inet_pton(AF_INET, address, &server_addr.sin_addr);
+
+        int res = connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr));
+        handle_winsock_error(res, "connect");
+
+        printf("Sucessfully established server connection\n");
+
+        Manifest* client_manifest = create_manifest();
+        scan_directory(client_manifest,path,"");
+
+        size_t encoded_size;
+        uint8_t* encoded_buffer = encode_manifest(client_manifest, &encoded_size);
+        send(client_socket, (char*)&encoded_size, sizeof(size_t), 0);
+        send(client_socket, (char*)encoded_buffer, encoded_size, 0);
+
+        shutdown(client_socket, SD_SEND);
+
+        char dummy_buffer[512];
+        int bytes_received;
+        do {
+            bytes_received = recv(client_socket, dummy_buffer, sizeof(dummy_buffer), 0);
+            if (bytes_received > 0) {
+                
+            } else if (bytes_received == 0) {
+                printf("connection closed sucesfully\n");
+            } else {
+                printf("connection closed by error %d\n", WSAGetLastError());
+            }
+        } while (bytes_received > 0);
+
+        closesocket(client_socket);
     } else {
         printf("invalid usage: commands are \"server\" or \"sync\"");
     }
