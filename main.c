@@ -111,6 +111,23 @@ int receive_file(SOCKET sock, FILE* file, size_t amount_to_read) {
     return 0; 
 }
 
+void create_directories(const char* file_path) {
+    char temp_path[MAX_PATH];
+    strncpy(temp_path, file_path, MAX_PATH);
+    temp_path[MAX_PATH - 1] = '\0';
+
+    for (char* p = temp_path; *p != '\0'; p++) {
+        if (*p == '\\' || *p == '/') {
+            char temp = *p;
+            *p = '\0';
+            
+            CreateDirectoryA(temp_path, NULL); 
+            
+            *p = temp;
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         printf("usage:\n %s PATH COMMAND ...",argv[0]);
@@ -183,6 +200,7 @@ int main(int argc, char *argv[]) {
         res = receive(client_socket, (char*)&encoded_size, sizeof(size_t));
         if (res!=0) {
             WSACleanup();
+            closesocket(client_socket);
             return EXIT_FAILURE;
         }
         printf("Manifest size: %zu\n",encoded_size);
@@ -190,6 +208,7 @@ int main(int argc, char *argv[]) {
         res = receive(client_socket, (char*)manifest_buffer, encoded_size);
         if (res!=0) {
             WSACleanup();
+            closesocket(client_socket);
             return EXIT_FAILURE;
         }
 
@@ -201,6 +220,7 @@ int main(int argc, char *argv[]) {
         if (!client_manifest) {
             printf("Failed to decode manifest.\n");
             WSACleanup();
+            closesocket(client_socket);
             return EXIT_FAILURE;
         }
         printf("%d\n",client_manifest->file_count);
@@ -223,6 +243,12 @@ int main(int argc, char *argv[]) {
             }
 
             if (needs_transfer) {
+                char full_path[MAX_PATH];
+                snprintf(full_path, MAX_PATH, "%s\\%s", path, s_file->path);
+
+                FILE* out_file = fopen(full_path, "rb");
+                if (!out_file) continue;
+
                 uint64_t file_size = s_file->size;
 
                 printf("Sending file %s (size %fkb)\n",s_file->path,(float)file_size/1000);
@@ -233,13 +259,8 @@ int main(int argc, char *argv[]) {
                 send(client_socket, (char*)&s_file->path_length, sizeof(s_file->path_length), 0);
                 send(client_socket, s_file->path, s_file->path_length, 0);
 
-                char full_path[MAX_PATH];
-                snprintf(full_path, MAX_PATH, "%s\\%s", path, s_file->path);
-
                 printf("Full file path: %s\n",full_path);
 
-                FILE* out_file = fopen(full_path, "rb");
-                if (!out_file) continue;
                 send_file(client_socket,out_file,file_size);
                 fclose(out_file);
                 uint8_t client_result;
@@ -274,7 +295,7 @@ int main(int argc, char *argv[]) {
     } else if (strncmp(command,"sync",4) == 0) {
         printf("client\n");
         if (argc < 4) {
-            printf("Usage: %s PATH sync ADDRESS");
+            printf("Usage: %s PATH sync ADDRESS\n", argv[0]);
             WSACleanup();
             return EXIT_FAILURE;
         }
@@ -304,6 +325,11 @@ int main(int argc, char *argv[]) {
 
         size_t encoded_size;
         uint8_t* encoded_buffer = encode_manifest(client_manifest, &encoded_size);
+        if (encoded_size > 1024*1024*100) {
+            printf("Manifest size > 100mb\n");
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
         send(client_socket, (char*)&encoded_size, sizeof(size_t), 0);
         send(client_socket, (char*)encoded_buffer, encoded_size, 0);
 
@@ -314,13 +340,24 @@ int main(int argc, char *argv[]) {
             if (received_size == 0) break;
             uint16_t path_length;
             receive(client_socket, (char*)&path_length, sizeof(path_length));
-            char local_path[path_length+2];
+            if (path_length>MAX_PATH) {
+                printf("path length exceeds limits!\n");
+                continue;
+            }
+            char local_path[path_length + 1];
             receive(client_socket, local_path, path_length);
             local_path[path_length] = '\0';
             printf("\nReceiving file %s (size %.2fkb)\n", local_path, (float)received_size/1000);
             char full_path[MAX_PATH];
             snprintf(full_path, MAX_PATH, "%s\\%s", path, local_path);
+            create_directories(full_path);
             FILE* in_file = fopen(full_path, "wb");
+            if (!in_file) {
+                printf("Failed to open %s for writing\n", full_path);
+                uint8_t result = 1; 
+                send(client_socket, (char*)&result, sizeof(result), 0);
+                continue;
+            }
             receive_file(client_socket, in_file, received_size);
             fclose(in_file);
             printf("Success\n");
