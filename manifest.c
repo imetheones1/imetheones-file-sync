@@ -4,6 +4,29 @@
 #include <string.h>
 #include <windows.h>
 #include "manifest.h"
+#include "sha256.h"
+
+void calculate_file_hash(const char* full_path, uint8_t* out_hash) {
+    printf("hashing file \"%s\"\n", full_path);
+    FILE* file = fopen(full_path, "rb");
+    if (!file) {
+        memset(out_hash, 0, SHA256_BLOCK_SIZE);
+        return;
+    }
+
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+
+    BYTE buffer[4096];
+    size_t bytes_read;
+    
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        sha256_update(&ctx, buffer, bytes_read);
+    }
+
+    sha256_final(&ctx, (BYTE*)out_hash);
+    fclose(file);
+}
 
 Manifest* create_manifest() {
     Manifest* m = (Manifest*)malloc(sizeof(Manifest));
@@ -15,7 +38,7 @@ Manifest* create_manifest() {
     return m;
 }
 
-void add_record(Manifest* m, uint64_t size, uint64_t mod_time, const char* path) {
+void add_record(Manifest* m, uint64_t size, uint64_t mod_time, const char* path, const uint8_t* checksum) {
     if (m->file_count >= m->capacity) {
         m->capacity *= 2;
         m->records = (ManifestFile*)realloc(m->records, m->capacity * sizeof(ManifestFile));
@@ -24,7 +47,12 @@ void add_record(Manifest* m, uint64_t size, uint64_t mod_time, const char* path)
     ManifestFile* record = &m->records[m->file_count];
     record->size = size;
     record->modified_time = mod_time;
-    memset(record->checksum, 0, 32); // Note: Implement SHA-256 hashing here later
+    
+    if (checksum) {
+        memcpy(record->checksum, checksum, 32);
+    } else {
+        memset(record->checksum, 0, 32);
+    }
     
     record->path_length = (uint16_t)strlen(path);
     record->path = (char*)malloc(record->path_length + 1);
@@ -65,7 +93,13 @@ void scan_directory(Manifest* m, const char* base_dir, const char* rel_path) {
             file_time.LowPart = find_data.ftLastWriteTime.dwLowDateTime;
             file_time.HighPart = find_data.ftLastWriteTime.dwHighDateTime;
 
-            add_record(m, file_size.QuadPart, file_time.QuadPart, item_rel_path);
+            char full_path[MAX_PATH];
+            snprintf(full_path, MAX_PATH, "%s\\%s", base_dir, item_rel_path);
+
+            uint8_t file_hash[SHA256_BLOCK_SIZE];
+            calculate_file_hash(full_path, file_hash);
+
+            add_record(m, file_size.QuadPart, file_time.QuadPart, item_rel_path, file_hash);
         }
     } while (FindNextFileA(hFind, &find_data) != 0);
 

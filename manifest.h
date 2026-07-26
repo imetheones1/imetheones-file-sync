@@ -21,13 +21,16 @@ typedef struct {
     ManifestFile* records;
 } Manifest;
 
+// hash a file using sha256.c
+void calculate_file_hash(const char* full_path, uint8_t* out_hash);
+
 // create empty manifest
 Manifest* create_manifest();
 
 // append file to manifest
-void add_record(Manifest* m, uint64_t size, uint64_t mod_time, const char* path);
+void add_record(Manifest* m, uint64_t size, uint64_t mod_time, const char* path, const uint8_t* checksum);
 
-// scan a directory into a manifest. base_dir is the directory to scan. call rel_path with ""
+// scan a directory into a manifest. base_dir is the directory to scan. call rel_path with "", since its used internally for recursion
 void scan_directory(Manifest* m, const char* base_dir, const char* rel_path);
 
 // file format
