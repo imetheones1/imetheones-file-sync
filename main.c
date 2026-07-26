@@ -8,6 +8,7 @@
 #include <winsock.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h>
 
 #include "manifest.h"
 
@@ -44,71 +45,128 @@ int receive(SOCKET sock, char* buffer, size_t amount_to_read) {
     return 0; 
 }
 
-int send_file(SOCKET sock, FILE* file, size_t amount_to_send) {
-    char chunk_buffer[8192]; // 8kb chunk buffer
-    size_t total_sent = 0;
+int send_file(SOCKET sock, const char* filepath, size_t amount_to_send) {
+    HANDLE file_handle = CreateFileA(
+        filepath, 
+        GENERIC_READ, 
+        FILE_SHARE_READ, 
+        NULL, 
+        OPEN_EXISTING, 
+        FILE_FLAG_SEQUENTIAL_SCAN, 
+        NULL
+    );
 
-    while (total_sent < amount_to_send) {
-        size_t remaining = amount_to_send - total_sent;
-        
-        size_t bytes_to_read = (remaining < sizeof(chunk_buffer)) ? remaining : sizeof(chunk_buffer);
-        size_t bytes_read = fread(chunk_buffer, 1, bytes_to_read, file);
-        
-        if (bytes_read < bytes_to_read && ferror(file)) {
-            printf("Error reading from file on disk\n");
-            return -3;
-        }
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        printf("Failed to open file on disk: %lu\n", GetLastError());
+        return -3;
+    }
 
-        size_t chunk_sent = 0;
-        while (chunk_sent < bytes_read) {
-            int bytes_sent = send(sock, chunk_buffer + chunk_sent, (int)(bytes_read - chunk_sent), 0);
-            
-            if (bytes_sent > 0) {
-                chunk_sent += bytes_sent;
-            } 
-            else {
-                printf("Failed to send data with code %d\n", WSAGetLastError());
-                return -1;
-            }
-        }
-        
-        total_sent += bytes_read;
+    BOOL success = TransmitFile(
+        sock, 
+        file_handle, 
+        (DWORD)amount_to_send, 
+        0,
+        NULL,
+        NULL,
+        0
+    );
+
+    CloseHandle(file_handle);
+
+    if (!success) {
+        printf("TransmitFile failed with code %d\n", WSAGetLastError());
+        return -1;
     }
 
     return 0;
 }
 
-int receive_file(SOCKET sock, FILE* file, size_t amount_to_read) {
-    char chunk_buffer[8192]; // 8kb chunk buffer
+int receive_file(SOCKET sock, const char* filepath, size_t amount_to_read) {
+    if (amount_to_read == 0) return 0;
+
+    HANDLE file_handle = CreateFileA(
+        filepath,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (file_handle == INVALID_HANDLE_VALUE) {
+        printf("Failed to create file on disk: %lu\n", GetLastError());
+        return -3;
+    }
+
+    LARGE_INTEGER li_size;
+    li_size.QuadPart = amount_to_read;
+
+    HANDLE mapping_handle = CreateFileMappingA(
+        file_handle,
+        NULL,
+        PAGE_READWRITE,
+        li_size.HighPart,
+        li_size.LowPart,
+        NULL
+    );
+
+    if (mapping_handle == NULL) {
+        printf("Failed to create file mapping: %lu\n", GetLastError());
+        CloseHandle(file_handle);
+        return -3;
+    }
+
+    LPVOID map_view = MapViewOfFile(
+        mapping_handle,
+        FILE_MAP_WRITE,
+        0,
+        0,
+        amount_to_read
+    );
+
+    if (map_view == NULL) {
+        printf("Failed to map view of file: %lu\n", GetLastError());
+        CloseHandle(mapping_handle);
+        CloseHandle(file_handle);
+        return -3;
+    }
+
+    char* buffer = (char*)map_view;
     size_t total_received = 0;
 
     while (total_received < amount_to_read) {
         size_t remaining = amount_to_read - total_received;
         
-        int request_size = (remaining < sizeof(chunk_buffer)) ? (int)remaining : sizeof(chunk_buffer);
+        // cap request size just in case
+        int request_size = (remaining > 2147483647) ? 2147483647 : (int)remaining;
 
-        int bytes_read = recv(sock, chunk_buffer, request_size, 0);
+        int bytes_read = recv(sock, buffer + total_received, request_size, 0);
 
         if (bytes_read > 0) {
-            size_t bytes_written = fwrite(chunk_buffer, 1, bytes_read, file);
-            if (bytes_written < (size_t)bytes_read) {
-                printf("Error writing to file on disk\n");
-                return -3;
-            }
-            
             total_received += bytes_read;
         } 
         else if (bytes_read == 0) {
             printf("Connection closed without reading full data\n");
+            UnmapViewOfFile(map_view);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
             return -1; 
         } 
         else {
             printf("Failed to receive data with code %d\n", WSAGetLastError());
+            UnmapViewOfFile(map_view);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
             return -2; 
         }
     }
 
-    return 0; 
+    UnmapViewOfFile(map_view);
+    CloseHandle(mapping_handle);
+    CloseHandle(file_handle);
+
+    return 0;
 }
 
 void create_directories(const char* file_path) {
@@ -212,6 +270,10 @@ int main(int argc, char *argv[]) {
         printf("Sucessfully established client connection\n");
 
         closesocket(server_socket);
+
+        Manifest* server_manifest = create_manifest();
+        scan_directory(server_manifest, path, "");
+
         size_t encoded_size = 0;
         res = receive(client_socket, (char*)&encoded_size, sizeof(size_t));
         if (res!=0) {
@@ -219,30 +281,34 @@ int main(int argc, char *argv[]) {
             closesocket(client_socket);
             return EXIT_FAILURE;
         }
+
         printf("Manifest size: %zu\n",encoded_size);
         uint8_t* manifest_buffer = malloc(encoded_size+5);
-        res = receive(client_socket, (char*)manifest_buffer, encoded_size);
-        if (res!=0) {
-            WSACleanup();
+        if (!manifest_buffer) {
+            printf("failed to allocate memory for manifest\n");
             closesocket(client_socket);
+            WSACleanup();
             return EXIT_FAILURE;
         }
-
-        Manifest* server_manifest = create_manifest();
-        scan_directory(server_manifest, path, "");
+        res = receive(client_socket, (char*)manifest_buffer, encoded_size);
+        if (res!=0) {
+            closesocket(client_socket);
+            WSACleanup();
+            return EXIT_FAILURE;
+        }
 
         Manifest* client_manifest = decode_manifest(manifest_buffer);
         free(manifest_buffer);
         if (!client_manifest) {
             printf("Failed to decode manifest.\n");
-            WSACleanup();
             closesocket(client_socket);
+            WSACleanup();
             return EXIT_FAILURE;
         }
-        printf("%d\n",client_manifest->file_count);
-        for (uint32_t i = 0; i < client_manifest->file_count; i++) {
-            printf("%d. %s\n",i+1,client_manifest->records[i].path);
-        }
+        // printf("%d\n",client_manifest->file_count);
+        // for (uint32_t i = 0; i < client_manifest->file_count; i++) {
+        //     printf("%d. %s\n",i+1,client_manifest->records[i].path);
+        // }
 
         for (uint32_t i = 0; i < server_manifest->file_count; i++) {
             ManifestFile* s_file = &server_manifest->records[i];
@@ -263,7 +329,11 @@ int main(int argc, char *argv[]) {
                 snprintf(full_path, MAX_PATH, "%s\\%s", path, s_file->path);
 
                 FILE* out_file = fopen(full_path, "rb");
-                if (!out_file) continue;
+                if (!out_file) {
+                    printf("File not found: %s",full_path);
+                    continue;
+                }
+                fclose(out_file);
 
                 uint64_t file_size = s_file->size;
 
@@ -279,7 +349,7 @@ int main(int argc, char *argv[]) {
 
                 printf("Full file path: %s\n",full_path);
 
-                send_file(client_socket,out_file,file_size);
+                send_file(client_socket,full_path,file_size);
                 fclose(out_file);
                 uint8_t client_result;
                 receive(client_socket, (char*)&client_result, sizeof(uint8_t));
@@ -350,6 +420,7 @@ int main(int argc, char *argv[]) {
         }
         send(client_socket, (char*)&encoded_size, sizeof(size_t), 0);
         send(client_socket, (char*)encoded_buffer, encoded_size, 0);
+        free(encoded_buffer);
 
         size_t received_count = 0;
 
@@ -373,15 +444,15 @@ int main(int argc, char *argv[]) {
             char full_path[MAX_PATH];
             snprintf(full_path, MAX_PATH, "%s\\%s", path, local_path);
             create_directories(full_path);
-            FILE* in_file = fopen(full_path, "wb");
-            if (!in_file) {
-                printf("Failed to open %s for writing\n", full_path);
+            int recv_status = receive_file(client_socket, full_path, received_size);
+            
+            if (recv_status != 0) {
+                printf("Failed to receive and write file %s\n", full_path);
                 uint8_t result = 1; 
                 send(client_socket, (char*)&result, sizeof(result), 0);
                 continue;
             }
-            receive_file(client_socket, in_file, received_size);
-            fclose(in_file);
+
             printf("Success\n");
             uint8_t result = 0;
             send(client_socket, (char*)&result, sizeof(result), 0);
