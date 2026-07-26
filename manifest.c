@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <winsock2.h>
 #include <windows.h>
 #include "manifest.h"
 #include "sha256.h"

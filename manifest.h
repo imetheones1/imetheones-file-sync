@@ -2,7 +2,6 @@
 #define MANIFEST_H_
 #include <stdint.h>
 
-
 // single file
 typedef struct ManifestFile {
     uint64_t size;
@@ -13,7 +12,7 @@ typedef struct ManifestFile {
 } ManifestFile;
 
 // entire manifest
-typedef struct {
+typedef struct Manifest {
     uint8_t     magic[4];   // 'S', 'Y', 'N', 'C'
     uint8_t     version;    // 0x01, in case protocol is ever changed
     uint32_t    file_count;
