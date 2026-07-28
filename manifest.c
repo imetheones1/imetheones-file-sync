@@ -8,7 +8,6 @@
 #include "sha256.h"
 
 void calculate_file_hash(const char* full_path, uint8_t* out_hash) {
-    printf("hashing file \"%s\"\n", full_path);
     FILE* file = fopen(full_path, "rb");
     if (!file) {
         memset(out_hash, 0, SHA256_BLOCK_SIZE);
@@ -62,7 +61,45 @@ void add_record(Manifest* m, uint64_t size, uint64_t mod_time, const char* path,
     m->file_count++;
 }
 
+uint32_t count_total_files(const char* base_dir, const char* rel_path) {
+    uint32_t count = 0;
+    char search_path[MAX_PATH];
+    snprintf(search_path, MAX_PATH, "%s\\%s\\*", base_dir, rel_path);
+
+    WIN32_FIND_DATAA find_data;
+    HANDLE hFind = FindFirstFileA(search_path, &find_data);
+    if (hFind == INVALID_HANDLE_VALUE) return 0;
+
+    do {
+        if (strcmp(find_data.cFileName, ".") == 0 || strcmp(find_data.cFileName, "..") == 0) continue;
+
+        char item_rel_path[MAX_PATH];
+        if (strlen(rel_path) > 0) {
+            snprintf(item_rel_path, MAX_PATH, "%s/%s", rel_path, find_data.cFileName);
+        } else {
+            snprintf(item_rel_path, MAX_PATH, "%s", find_data.cFileName);
+        }
+
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            count += count_total_files(base_dir, item_rel_path);
+        } else {
+            count++;
+        }
+    } while (FindNextFileA(hFind, &find_data) != 0);
+
+    FindClose(hFind);
+    return count;
+}
+
 void scan_directory(Manifest* m, const char* base_dir, const char* rel_path) {
+    static uint32_t total_files_to_scan = 0;
+    static uint32_t current_file_index = 0;
+
+    if (rel_path[0] == '\0') {
+        total_files_to_scan = count_total_files(base_dir, "");
+        current_file_index = 0;
+    }
+
     char search_path[MAX_PATH];
     snprintf(search_path, MAX_PATH, "%s\\%s\\*", base_dir, rel_path);
 
@@ -86,6 +123,11 @@ void scan_directory(Manifest* m, const char* base_dir, const char* rel_path) {
         if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             scan_directory(m, base_dir, item_rel_path);
         } else {
+            current_file_index++;
+            
+            printf("\rScanning [%u/%u]: %-50.50s       ", current_file_index, total_files_to_scan, find_data.cFileName);
+            fflush(stdout); 
+            
             ULARGE_INTEGER file_size;
             file_size.LowPart = find_data.nFileSizeLow;
             file_size.HighPart = find_data.nFileSizeHigh;
@@ -105,6 +147,10 @@ void scan_directory(Manifest* m, const char* base_dir, const char* rel_path) {
     } while (FindNextFileA(hFind, &find_data) != 0);
 
     FindClose(hFind);
+    
+    if (rel_path[0] == '\0') {
+        printf("\n");
+    }
 }
 
 uint8_t* encode_manifest(Manifest* m, size_t* out_size) {
