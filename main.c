@@ -330,7 +330,7 @@ int main(int argc, char *argv[]) {
 
                 FILE* out_file = fopen(full_path, "rb");
                 if (!out_file) {
-                    printf("File not found: %s",full_path);
+                    printf("\nFile not found: %s\n",full_path);
                     continue;
                 }
                 fclose(out_file);
@@ -339,28 +339,29 @@ int main(int argc, char *argv[]) {
 
                 char filesize_text[32];
                 format_file_size(filesize_text,sizeof(filesize_text),file_size);
-                printf("Sending file %s (size %s)\n",s_file->path,filesize_text);
-
+                
+                double progress_pct = ((double)(i + 1) / server_manifest->file_count) * 100.0;
+                printf("\rSending %u/%u (%.1f%%) | %s (%s)                          ", i + 1, server_manifest->file_count, progress_pct, s_file->path, filesize_text);
+                fflush(stdout);
 
                 send(client_socket, (char*)&file_size, sizeof(file_size), 0);
-
                 send(client_socket, (char*)&s_file->path_length, sizeof(s_file->path_length), 0);
                 send(client_socket, s_file->path, s_file->path_length, 0);
 
-                printf("Full file path: %s\n",full_path);
-
                 send_file(client_socket,full_path,file_size);
-                fclose(out_file);
+                
                 uint8_t client_result;
                 receive(client_socket, (char*)&client_result, sizeof(uint8_t));
                 if (client_result!=0) {
-                    printf("client returned failure\n");
+                    printf("\nclient returned failure on file %s\n", s_file->path);
                     WSACleanup();
                     return EXIT_FAILURE;
                 }
-                printf("\n");
             }
         }
+        
+        printf("\n\nAll files transferred successfully\n");
+        
         uint64_t zero_size = 0;
         send(client_socket, (char*)&zero_size, sizeof(zero_size), 0);
 
@@ -423,43 +424,49 @@ int main(int argc, char *argv[]) {
         free(encoded_buffer);
 
         size_t received_count = 0;
-
         uint64_t received_size;
+        
         do {
             received_size = 0;
             receive(client_socket, (char*)&received_size, sizeof(received_size));
             if (received_size == 0) break;
+            
             uint16_t path_length;
             receive(client_socket, (char*)&path_length, sizeof(path_length));
             if (path_length>MAX_PATH) {
-                printf("path length exceeds limits!\n");
+                printf("\npath length exceeds limits!\n");
                 continue;
             }
+            
             char local_path[path_length + 1];
             receive(client_socket, local_path, path_length);
             local_path[path_length] = '\0';
+            
             char filesize_text[32];
             format_file_size(filesize_text,sizeof(filesize_text),received_size);
-            printf("\nReceiving file %s (size %s)\n",local_path,filesize_text);
+            
+            printf("\rReceiving File %zu | %s (%s)                          ", received_count + 1, local_path, filesize_text);
+            fflush(stdout);
+            
             char full_path[MAX_PATH];
             snprintf(full_path, MAX_PATH, "%s\\%s", path, local_path);
             create_directories(full_path);
+            
             int recv_status = receive_file(client_socket, full_path, received_size);
             
             if (recv_status != 0) {
-                printf("Failed to receive and write file %s\n", full_path);
+                printf("\nFailed to receive and write file %s\n", full_path);
                 uint8_t result = 1; 
                 send(client_socket, (char*)&result, sizeof(result), 0);
                 continue;
             }
 
-            printf("Success\n");
             uint8_t result = 0;
             send(client_socket, (char*)&result, sizeof(result), 0);
             received_count++;
         } while (received_size > 0);
 
-        printf("\nSuccesfully received %zu files\n",received_count);
+        printf("\n\nSuccesfully received %zu files\n",received_count);
 
         shutdown(client_socket, SD_SEND);
         closesocket(client_socket);
