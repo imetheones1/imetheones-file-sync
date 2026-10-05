@@ -1,478 +1,790 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <inttypes.h>
-#include <string.h>
-#include <stdbool.h>
-
-#include <winsock.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mswsock.h>
+#include <windows.h>
+#include <bcrypt.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+#include <limits.h>
 
 #include "manifest.h"
+#include "util.h"
 
-#define port 2026 // todo choose a good port
+#define PORT 2026 // todo choose a good port
+#define PORT_STRING "2026"
 
-#define handle_winsock_error(res, function_name) do { if (res != 0) { printf(function_name " failed with code %d",res); WSACleanup(); return EXIT_FAILURE; }} while (0)
+#define MAX_MANIFEST_SIZE   (512ull * 1024 * 1024)
+#define NET_BUFFER_SIZE     (1024 * 1024)
+#define SMALL_FILE_SIZE     (256 * 1024)       // batched into one send
+#define TRANSMIT_CHUNK_SIZE (64u * 1024 * 1024) // TransmitFile max is 2^31 - 2 bytes
 
-int receive(SOCKET sock, char* buffer, size_t amount_to_read) {
-    size_t total_received = 0;
+// protocol (little endian)
+//  client -> server: uint64 manifest size, manifest (see manifest.h)
+//  server -> client: uint32 number of files that will be sent, uint64 total bytes
+//  server -> client: any number of messages, each starting with a uint8 type
+//      MSG_FILE: uint64 size, uint64 modified time, uint16 path length, path, file contents
+//      MSG_END:  uint32 number of files actually sent. ends the stream
+//  client -> server: uint32 files written, uint32 files failed
+enum { MSG_END = 0, MSG_FILE = 1 };
 
-    while (total_received < amount_to_read) {
-        size_t remaining = amount_to_read - total_received;
-        
-        // cap request size just in case
-        int request_size = (remaining > 2147483647) ? 2147483647 : (int)remaining;
+// ---- socket helpers ----
 
-        int bytes_read = recv(sock, buffer + total_received, request_size, 0);
-
-        if (bytes_read > 0) {
-            total_received += bytes_read;
-        } 
-        else if (bytes_read == 0) {
-            // connection closed sucessfully, but not enough bytes
-            printf("Connection closed without reading full data\n");
-            return -1; 
-        } 
-        else {
-            // network error occured
-            printf("Failed to receive data with code %d\n",WSAGetLastError());
-            return -2; 
+static bool send_all(SOCKET sock, const void* data, size_t size) {
+    const char* ptr = data;
+    while (size > 0) {
+        int chunk = size > INT_MAX ? INT_MAX : (int)size;
+        int sent = send(sock, ptr, chunk, 0);
+        if (sent == SOCKET_ERROR) {
+            printf("\nFailed to send data with code %d\n", WSAGetLastError());
+            return false;
         }
+        ptr += sent;
+        size -= sent;
     }
-
-    return 0; 
+    return true;
 }
 
-int send_file(SOCKET sock, const char* filepath, size_t amount_to_send) {
-    HANDLE file_handle = CreateFileA(
-        filepath, 
-        GENERIC_READ, 
-        FILE_SHARE_READ, 
-        NULL, 
-        OPEN_EXISTING, 
-        FILE_FLAG_SEQUENTIAL_SCAN, 
-        NULL
-    );
-
-    if (file_handle == INVALID_HANDLE_VALUE) {
-        printf("Failed to open file on disk: %lu\n", GetLastError());
-        return -3;
+static bool recv_all(SOCKET sock, void* data, size_t size) {
+    char* ptr = data;
+    while (size > 0) {
+        int chunk = size > INT_MAX ? INT_MAX : (int)size;
+        int received = recv(sock, ptr, chunk, 0);
+        if (received == 0) {
+            printf("\nConnection closed unexpectedly\n");
+            return false;
+        }
+        if (received == SOCKET_ERROR) {
+            printf("\nFailed to receive data with code %d\n", WSAGetLastError());
+            return false;
+        }
+        ptr += received;
+        size -= received;
     }
-
-    BOOL success = TransmitFile(
-        sock, 
-        file_handle, 
-        (DWORD)amount_to_send, 
-        0,
-        NULL,
-        NULL,
-        0
-    );
-
-    CloseHandle(file_handle);
-
-    if (!success) {
-        printf("TransmitFile failed with code %d\n", WSAGetLastError());
-        return -1;
-    }
-
-    return 0;
+    return true;
 }
 
-int receive_file(SOCKET sock, const char* filepath, size_t amount_to_read) {
-    if (amount_to_read == 0) return 0;
+// batches small writes into large sends
+typedef struct SendBuffer {
+    SOCKET   sock;
+    uint8_t* data;
+    size_t   used;
+} SendBuffer;
 
-    HANDLE file_handle = CreateFileA(
-        filepath,
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        NULL,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (file_handle == INVALID_HANDLE_VALUE) {
-        printf("Failed to create file on disk: %lu\n", GetLastError());
-        return -3;
-    }
-
-    LARGE_INTEGER li_size;
-    li_size.QuadPart = amount_to_read;
-
-    HANDLE mapping_handle = CreateFileMappingA(
-        file_handle,
-        NULL,
-        PAGE_READWRITE,
-        li_size.HighPart,
-        li_size.LowPart,
-        NULL
-    );
-
-    if (mapping_handle == NULL) {
-        printf("Failed to create file mapping: %lu\n", GetLastError());
-        CloseHandle(file_handle);
-        return -3;
-    }
-
-    LPVOID map_view = MapViewOfFile(
-        mapping_handle,
-        FILE_MAP_WRITE,
-        0,
-        0,
-        amount_to_read
-    );
-
-    if (map_view == NULL) {
-        printf("Failed to map view of file: %lu\n", GetLastError());
-        CloseHandle(mapping_handle);
-        CloseHandle(file_handle);
-        return -3;
-    }
-
-    char* buffer = (char*)map_view;
-    size_t total_received = 0;
-
-    while (total_received < amount_to_read) {
-        size_t remaining = amount_to_read - total_received;
-        
-        // cap request size just in case
-        int request_size = (remaining > 2147483647) ? 2147483647 : (int)remaining;
-
-        int bytes_read = recv(sock, buffer + total_received, request_size, 0);
-
-        if (bytes_read > 0) {
-            total_received += bytes_read;
-        } 
-        else if (bytes_read == 0) {
-            printf("Connection closed without reading full data\n");
-            UnmapViewOfFile(map_view);
-            CloseHandle(mapping_handle);
-            CloseHandle(file_handle);
-            return -1; 
-        } 
-        else {
-            printf("Failed to receive data with code %d\n", WSAGetLastError());
-            UnmapViewOfFile(map_view);
-            CloseHandle(mapping_handle);
-            CloseHandle(file_handle);
-            return -2; 
-        }
-    }
-
-    UnmapViewOfFile(map_view);
-    CloseHandle(mapping_handle);
-    CloseHandle(file_handle);
-
-    return 0;
+static bool flush_buffer(SendBuffer* b) {
+    bool success = send_all(b->sock, b->data, b->used);
+    b->used = 0;
+    return success;
 }
 
-void create_directories(const char* file_path) {
-    char temp_path[MAX_PATH];
-    strncpy(temp_path, file_path, MAX_PATH);
-    temp_path[MAX_PATH - 1] = '\0';
-
-    for (char* p = temp_path; *p != '\0'; p++) {
-        if (*p == '\\' || *p == '/') {
-            char temp = *p;
-            *p = '\0';
-            
-            CreateDirectoryA(temp_path, NULL); 
-            
-            *p = temp;
-        }
-    }
+// flushes if size doesn't fit
+static bool reserve_buffer(SendBuffer* b, size_t size) {
+    if (b->used + size > NET_BUFFER_SIZE) return flush_buffer(b);
+    return true;
 }
 
-void format_file_size(char *buffer, size_t buffer_size, double bytes) {
-    const char *units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
-    int unit_index = 0;
-
-    while (bytes >= 1024 && unit_index < 5) {
-        bytes /= 1024;
-        unit_index++;
-    }
-
-    if (unit_index == 0) {
-        snprintf(buffer, buffer_size, "%.0f %s", bytes, units[unit_index]);
-    } else {
-        snprintf(buffer, buffer_size, "%.2f %s", bytes, units[unit_index]);
-    }
+static bool append_buffer(SendBuffer* b, const void* data, size_t size) {
+    if (!reserve_buffer(b, size)) return false;
+    memcpy(b->data + b->used, data, size);
+    b->used += size;
+    return true;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        printf("usage:\n %s PATH COMMAND ...",argv[0]);
-        exit(EXIT_FAILURE);
+// buffered so small fields don't each need a recv
+typedef struct Reader {
+    SOCKET   sock;
+    uint8_t* data;
+    size_t   start;
+    size_t   end;
+} Reader;
+
+static bool fill_reader(Reader* r) {
+    int received = recv(r->sock, (char*)r->data, NET_BUFFER_SIZE, 0);
+    if (received == 0) {
+        printf("\nConnection closed unexpectedly\n");
+        return false;
+    }
+    if (received == SOCKET_ERROR) {
+        printf("\nFailed to receive data with code %d\n", WSAGetLastError());
+        return false;
+    }
+    r->start = 0;
+    r->end = received;
+    return true;
+}
+
+static bool read_exact(Reader* r, void* out, size_t size) {
+    uint8_t* ptr = out;
+    while (size > 0) {
+        if (r->start == r->end && !fill_reader(r)) return false;
+        size_t available = r->end - r->start;
+        size_t n = size < available ? size : available;
+        memcpy(ptr, r->data + r->start, n);
+        r->start += n;
+        ptr += n;
+        size -= n;
+    }
+    return true;
+}
+
+// ---- server ----
+
+static bool transmit_file(SOCKET sock, HANDLE file, uint64_t size) {
+    for (uint64_t offset = 0; offset < size; ) {
+        uint64_t remaining = size - offset;
+        DWORD chunk = remaining > TRANSMIT_CHUNK_SIZE ? TRANSMIT_CHUNK_SIZE : (DWORD)remaining;
+
+        // TransmitFile starts at the current position
+        LARGE_INTEGER position;
+        position.QuadPart = offset;
+        if (!SetFilePointerEx(file, position, NULL, FILE_BEGIN)) {
+            printf("\nFailed to seek file with code %lu\n", GetLastError());
+            return false;
+        }
+        if (!TransmitFile(sock, file, chunk, 0, NULL, NULL, 0)) {
+            printf("\nTransmitFile failed with code %d\n", WSAGetLastError());
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+}
+
+static bool read_file_exact(HANDLE file, uint8_t* out, size_t size) {
+    while (size > 0) {
+        DWORD bytes_read;
+        if (!ReadFile(file, out, (DWORD)size, &bytes_read, NULL) || bytes_read == 0) return false;
+        out += bytes_read;
+        size -= bytes_read;
+    }
+    return true;
+}
+
+static void print_transfer_progress(const char* verb, uint32_t done, uint32_t total, uint64_t bytes, uint64_t total_bytes, double start_time, const char* path) {
+    char bytes_text[32], total_text[32], rate_text[32], name[48];
+    double elapsed = now_seconds() - start_time;
+    format_file_size(bytes_text, sizeof(bytes_text), (double)bytes);
+    format_file_size(total_text, sizeof(total_text), (double)total_bytes);
+    format_file_size(rate_text, sizeof(rate_text), elapsed > 0 ? bytes / elapsed : 0);
+    utf8_truncate(name, sizeof(name), path, 40);
+    progress_print("%s [%u/%u] %s / %s (%s/s) %s", verb, done, total, bytes_text, total_text, rate_text, name);
+}
+
+static bool send_files(SOCKET sock, const wchar_t* base_dir, const Manifest* local, const Manifest* remote) {
+    uint32_t* to_send = malloc((local->file_count + 1) * sizeof(uint32_t));
+    SendBuffer buffer = { .sock = sock, .data = malloc(NET_BUFFER_SIZE) };
+    if (!to_send || !buffer.data) {
+        printf("Failed to allocate memory for sending\n");
+        free(to_send);
+        free(buffer.data);
+        return false;
     }
 
-    char* path = argv[1];
-    char* command = argv[2];
-    
-    if (strncmp(command,"test",4) == 0){
-        Manifest* test_manifest = create_manifest();
-
-        scan_directory(test_manifest,argv[1],"");
-
-        printf("%d\n",test_manifest->file_count);
-        for (uint32_t i = 0; i < test_manifest->file_count; i++) {
-            printf("%d. %s\n",i+1,test_manifest->records[i].path);
+    uint32_t send_count = 0;
+    uint64_t send_bytes = 0;
+    for (uint32_t i = 0; i < local->file_count; i++) {
+        const ManifestFile* r = &local->records[i];
+        const ManifestFile* theirs = find_record(remote, r->path);
+        if (!theirs || memcmp(r->checksum, theirs->checksum, HASH_SIZE) != 0) {
+            to_send[send_count++] = i;
+            send_bytes += r->size;
         }
-
-        size_t test_encode_out_size;
-        uint8_t* test_encode = encode_manifest(test_manifest, &test_encode_out_size);
-        Manifest* test_decode = decode_manifest(test_encode);
-
-        printf("%d\n",test_decode->file_count);
-        for (uint32_t i = 0; i < test_decode->file_count; i++) {
-            printf("%d. %s\n",i+1,test_decode->records[i].path);
-        }
-
-        return EXIT_SUCCESS;
     }
 
-    int res;
+    char size_text[32];
+    format_file_size(size_text, sizeof(size_text), (double)send_bytes);
+    printf("%u files (%s) need to be sent\n", send_count, size_text);
 
-    WSADATA wsa_data;
-    res = WSAStartup(MAKEWORD(2,2), (LPWSADATA)(&wsa_data));
-    handle_winsock_error(res, "WSAStartup");
+    bool success = append_buffer(&buffer, &send_count, 4) && append_buffer(&buffer, &send_bytes, 8);
 
-    if (strncmp(command,"server",6) == 0) {
-        printf("server\n");
-        SOCKET server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (server_socket == INVALID_SOCKET) {
-            printf("Socket creation failed with code %d",WSAGetLastError());
-            WSACleanup();
-            return EXIT_FAILURE;
+    uint32_t sent_count = 0;
+    uint64_t bytes_sent = 0;
+    double start_time = now_seconds();
+
+    for (uint32_t i = 0; i < send_count && success; i++) {
+        const ManifestFile* r = &local->records[to_send[i]];
+
+        // no write sharing so the size can't change while sending
+        wchar_t* full_path = join_path(base_dir, r->path, r->path_length);
+        HANDLE file = full_path ? CreateFileW(full_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL) : INVALID_HANDLE_VALUE;
+        free(full_path);
+
+        BY_HANDLE_FILE_INFORMATION info;
+        if (file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file, &info)) {
+            printf("\nFailed to open \"%s\" with code %lu, skipping it\n", r->path, GetLastError());
+            if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+            continue;
         }
 
-        struct sockaddr_in addr_in = {
-            .sin_family = AF_INET,
-            .sin_addr = INADDR_ANY,
-            .sin_port = htons(port)
-        };
-        
-        res = bind(server_socket, (struct sockaddr*)&addr_in, sizeof(addr_in));
-        handle_winsock_error(res, "bind");
+        uint64_t size = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+        uint64_t modified_time = ((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32) | info.ftLastWriteTime.dwLowDateTime;
 
-        res = listen(server_socket, SOMAXCONN);
-        handle_winsock_error(res, "listen");
+        uint8_t type = MSG_FILE;
+        success = append_buffer(&buffer, &type, 1)
+            && append_buffer(&buffer, &size, 8)
+            && append_buffer(&buffer, &modified_time, 8)
+            && append_buffer(&buffer, &r->path_length, 2)
+            && append_buffer(&buffer, r->path, r->path_length);
 
-        SOCKET client_socket = accept(server_socket, NULL, NULL);
-        if (client_socket == INVALID_SOCKET) {
-            printf("Client socket accept failed with code %d",WSAGetLastError());
-            WSACleanup();
-            return EXIT_FAILURE;
-        }
-
-        printf("Sucessfully established client connection\n");
-
-        closesocket(server_socket);
-
-        Manifest* server_manifest = create_manifest();
-        scan_directory(server_manifest, path, "");
-
-        size_t encoded_size = 0;
-        res = receive(client_socket, (char*)&encoded_size, sizeof(size_t));
-        if (res!=0) {
-            WSACleanup();
-            closesocket(client_socket);
-            return EXIT_FAILURE;
-        }
-
-        printf("Manifest size: %zu\n",encoded_size);
-        uint8_t* manifest_buffer = malloc(encoded_size+5);
-        if (!manifest_buffer) {
-            printf("failed to allocate memory for manifest\n");
-            closesocket(client_socket);
-            WSACleanup();
-            return EXIT_FAILURE;
-        }
-        res = receive(client_socket, (char*)manifest_buffer, encoded_size);
-        if (res!=0) {
-            closesocket(client_socket);
-            WSACleanup();
-            return EXIT_FAILURE;
-        }
-
-        Manifest* client_manifest = decode_manifest(manifest_buffer);
-        free(manifest_buffer);
-        if (!client_manifest) {
-            printf("Failed to decode manifest.\n");
-            closesocket(client_socket);
-            WSACleanup();
-            return EXIT_FAILURE;
-        }
-        // printf("%d\n",client_manifest->file_count);
-        // for (uint32_t i = 0; i < client_manifest->file_count; i++) {
-        //     printf("%d. %s\n",i+1,client_manifest->records[i].path);
-        // }
-
-        for (uint32_t i = 0; i < server_manifest->file_count; i++) {
-            ManifestFile* s_file = &server_manifest->records[i];
-            bool needs_transfer = true;
-
-            for (uint32_t j = 0; j < client_manifest->file_count; j++) {
-                ManifestFile* c_file = &client_manifest->records[j];
-                if (strncmp(s_file->path,c_file->path,MAX_PATH) == 0) {
-                    if (memcmp(s_file->checksum,c_file->checksum, 32) == 0) {
-                        needs_transfer = false;
-                    }
-                    break;
+        if (success) {
+            if (size <= SMALL_FILE_SIZE) {
+                success = reserve_buffer(&buffer, (size_t)size);
+                if (success && !read_file_exact(file, buffer.data + buffer.used, (size_t)size)) {
+                    // header is already queued, can't skip this file
+                    printf("\nFailed to read \"%s\" with code %lu\n", r->path, GetLastError());
+                    success = false;
                 }
-            }
-
-            if (needs_transfer) {
-                char full_path[MAX_PATH];
-                snprintf(full_path, MAX_PATH, "%s\\%s", path, s_file->path);
-
-                FILE* out_file = fopen(full_path, "rb");
-                if (!out_file) {
-                    printf("\nFile not found: %s\n",full_path);
-                    continue;
-                }
-                fclose(out_file);
-
-                uint64_t file_size = s_file->size;
-
-                char filesize_text[32];
-                format_file_size(filesize_text,sizeof(filesize_text),file_size);
-                
-                double progress_pct = ((double)(i + 1) / server_manifest->file_count) * 100.0;
-                printf("\rSending %u/%u (%.1f%%) | %s (%s)                          ", i + 1, server_manifest->file_count, progress_pct, s_file->path, filesize_text);
-                fflush(stdout);
-
-                send(client_socket, (char*)&file_size, sizeof(file_size), 0);
-                send(client_socket, (char*)&s_file->path_length, sizeof(s_file->path_length), 0);
-                send(client_socket, s_file->path, s_file->path_length, 0);
-
-                send_file(client_socket,full_path,file_size);
-                
-                uint8_t client_result;
-                receive(client_socket, (char*)&client_result, sizeof(uint8_t));
-                if (client_result!=0) {
-                    printf("\nclient returned failure on file %s\n", s_file->path);
-                    WSACleanup();
-                    return EXIT_FAILURE;
-                }
-            }
-        }
-        
-        printf("\n\nAll files transferred successfully\n");
-        
-        uint64_t zero_size = 0;
-        send(client_socket, (char*)&zero_size, sizeof(zero_size), 0);
-
-        shutdown(client_socket, SD_SEND);
-
-        char dummy_buffer[512];
-        int bytes_received;
-        do {
-            bytes_received = recv(client_socket, dummy_buffer, sizeof(dummy_buffer), 0);
-            if (bytes_received > 0) {
-                
-            } else if (bytes_received == 0) {
-                printf("connection closed sucesfully\n");
+                buffer.used += (size_t)size;
             } else {
-                printf("connection closed by error %d\n", WSAGetLastError());
+                success = flush_buffer(&buffer) && transmit_file(sock, file, size);
             }
-        } while (bytes_received > 0);
-
-        closesocket(client_socket);
-    } else if (strncmp(command,"sync",4) == 0) {
-        printf("client\n");
-        if (argc < 4) {
-            printf("Usage: %s PATH sync ADDRESS\n", argv[0]);
-            WSACleanup();
-            return EXIT_FAILURE;
         }
+        CloseHandle(file);
 
-        char* address = argv[3];
-
-        SOCKET client_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (client_socket == INVALID_SOCKET) {
-            printf("Socket creation failed with code %d",WSAGetLastError());
-            WSACleanup();
-            return EXIT_FAILURE;
-        }
-
-        struct sockaddr_in server_addr = { 
-            .sin_family = AF_INET, 
-            .sin_port = htons(port) 
-        };
-        inet_pton(AF_INET, address, &server_addr.sin_addr);
-
-        int res = connect(client_socket, (struct sockaddr*)&server_addr, sizeof(server_addr));
-        handle_winsock_error(res, "connect");
-
-        printf("Sucessfully established server connection\n");
-
-        Manifest* client_manifest = create_manifest();
-        scan_directory(client_manifest, path, "");
-
-        size_t encoded_size;
-        uint8_t* encoded_buffer = encode_manifest(client_manifest, &encoded_size);
-        if (encoded_size > 1024*1024*100) {
-            printf("Manifest size > 100mb\n");
-            WSACleanup();
-            return EXIT_FAILURE;
-        }
-        send(client_socket, (char*)&encoded_size, sizeof(size_t), 0);
-        send(client_socket, (char*)encoded_buffer, encoded_size, 0);
-        free(encoded_buffer);
-
-        size_t received_count = 0;
-        uint64_t received_size;
-        
-        do {
-            received_size = 0;
-            receive(client_socket, (char*)&received_size, sizeof(received_size));
-            if (received_size == 0) break;
-            
-            uint16_t path_length;
-            receive(client_socket, (char*)&path_length, sizeof(path_length));
-            if (path_length>MAX_PATH) {
-                printf("\npath length exceeds limits!\n");
-                continue;
+        if (success) {
+            sent_count++;
+            bytes_sent += size;
+            if (progress_due() || sent_count == send_count) {
+                print_transfer_progress("Sending", sent_count, send_count, bytes_sent, send_bytes, start_time, r->path);
             }
-            
-            char local_path[path_length + 1];
-            receive(client_socket, local_path, path_length);
-            local_path[path_length] = '\0';
-            
-            char filesize_text[32];
-            format_file_size(filesize_text,sizeof(filesize_text),received_size);
-            
-            printf("\rReceiving File %zu | %s (%s)                          ", received_count + 1, local_path, filesize_text);
-            fflush(stdout);
-            
-            char full_path[MAX_PATH];
-            snprintf(full_path, MAX_PATH, "%s\\%s", path, local_path);
-            create_directories(full_path);
-            
-            int recv_status = receive_file(client_socket, full_path, received_size);
-            
-            if (recv_status != 0) {
-                printf("\nFailed to receive and write file %s\n", full_path);
-                uint8_t result = 1; 
-                send(client_socket, (char*)&result, sizeof(result), 0);
-                continue;
-            }
-
-            uint8_t result = 0;
-            send(client_socket, (char*)&result, sizeof(result), 0);
-            received_count++;
-        } while (received_size > 0);
-
-        printf("\n\nSuccesfully received %zu files\n",received_count);
-
-        shutdown(client_socket, SD_SEND);
-        closesocket(client_socket);
-    } else {
-        printf("invalid usage: commands are \"server\" or \"sync\"");
+        }
     }
 
-    WSACleanup();
+    if (success) {
+        uint8_t type = MSG_END;
+        success = append_buffer(&buffer, &type, 1)
+            && append_buffer(&buffer, &sent_count, 4)
+            && flush_buffer(&buffer);
+    }
+    if (send_count > 0) progress_end();
+
+    uint32_t client_results[2]; // written, failed
+    if (success && recv_all(sock, client_results, sizeof(client_results))) {
+        double elapsed = now_seconds() - start_time;
+        format_file_size(size_text, sizeof(size_text), (double)bytes_sent);
+        printf("Sent %u files (%s) in %.2fs. Client wrote %u, failed %u\n",
+               sent_count, size_text, elapsed, client_results[0], client_results[1]);
+        if (client_results[1] > 0) success = false;
+    } else {
+        success = false;
+    }
+
+    free(to_send);
+    free(buffer.data);
+    return success;
+}
+
+static int run_server(const wchar_t* base_dir) {
+    int result = EXIT_FAILURE;
+    SOCKET listen_socket = INVALID_SOCKET;
+    SOCKET client_socket = INVALID_SOCKET;
+    Manifest* local_manifest = NULL;
+    Manifest* client_manifest = NULL;
+    uint8_t* manifest_buffer = NULL;
+
+    // dual stack, accepts IPv4 and IPv6
+    listen_socket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_socket == INVALID_SOCKET) {
+        printf("Socket creation failed with code %d\n", WSAGetLastError());
+        goto cleanup;
+    }
+    DWORD v6_only = 0;
+    setsockopt(listen_socket, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&v6_only, sizeof(v6_only));
+
+    struct sockaddr_in6 address = {
+        .sin6_family = AF_INET6,
+        .sin6_port = htons(PORT),
+        .sin6_addr = IN6ADDR_ANY_INIT,
+    };
+#ifdef LOOPBACK_ONLY
+    // for testing, loopback only doesn't trigger the firewall prompt
+    // ::ffff:127.0.0.1
+    address.sin6_addr.s6_addr[10] = 0xff;
+    address.sin6_addr.s6_addr[11] = 0xff;
+    address.sin6_addr.s6_addr[12] = 127;
+    address.sin6_addr.s6_addr[15] = 1;
+#endif
+    if (bind(listen_socket, (struct sockaddr*)&address, sizeof(address)) != 0) {
+        printf("bind failed with code %d\n", WSAGetLastError());
+        goto cleanup;
+    }
+    if (listen(listen_socket, 1) != 0) {
+        printf("listen failed with code %d\n", WSAGetLastError());
+        goto cleanup;
+    }
+
+    printf("Waiting for a client on port %d\n", PORT);
+    struct sockaddr_storage client_address;
+    int client_address_length = sizeof(client_address);
+    client_socket = accept(listen_socket, (struct sockaddr*)&client_address, &client_address_length);
+    if (client_socket == INVALID_SOCKET) {
+        printf("Client socket accept failed with code %d\n", WSAGetLastError());
+        goto cleanup;
+    }
+    closesocket(listen_socket);
+    listen_socket = INVALID_SOCKET;
+
+    char host[NI_MAXHOST];
+    if (getnameinfo((struct sockaddr*)&client_address, client_address_length, host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0) {
+        strcpy(host, "unknown address");
+    }
+    printf("Client connected from %s\n", host);
+
+    Manifest* cache = load_cache(base_dir);
+    local_manifest = scan_directory(base_dir, cache);
+    free_manifest(cache);
+    if (!local_manifest) {
+        printf("Failed to scan folder\n");
+        goto cleanup;
+    }
+    if (!save_cache(base_dir, local_manifest)) {
+        printf("Warning: couldn't save the cache file, the next scan will hash everything again\n");
+    }
+
+    uint64_t manifest_size;
+    if (!recv_all(client_socket, &manifest_size, sizeof(manifest_size))) goto cleanup;
+    if (manifest_size > MAX_MANIFEST_SIZE) {
+        printf("Client manifest is too large (%llu bytes)\n", (unsigned long long)manifest_size);
+        goto cleanup;
+    }
+
+    manifest_buffer = malloc((size_t)manifest_size);
+    if (!manifest_buffer) {
+        printf("Failed to allocate memory for manifest\n");
+        goto cleanup;
+    }
+    if (!recv_all(client_socket, manifest_buffer, (size_t)manifest_size)) goto cleanup;
+
+    client_manifest = decode_manifest(manifest_buffer, (size_t)manifest_size);
+    if (!client_manifest) {
+        printf("Client sent an invalid manifest. Are both sides running the same version?\n");
+        goto cleanup;
+    }
+    sort_manifest(client_manifest);
+
+    if (send_files(client_socket, base_dir, local_manifest, client_manifest)) {
+        result = EXIT_SUCCESS;
+    }
+    shutdown(client_socket, SD_SEND);
+
+cleanup:
+    if (client_socket != INVALID_SOCKET) closesocket(client_socket);
+    if (listen_socket != INVALID_SOCKET) closesocket(listen_socket);
+    free(manifest_buffer);
+    free_manifest(local_manifest);
+    free_manifest(client_manifest);
+    return result;
+}
+
+// ---- client ----
+
+static bool ends_with(const char* s, size_t length, const char* suffix) {
+    size_t suffix_length = strlen(suffix);
+    return length >= suffix_length && memcmp(s + length - suffix_length, suffix, suffix_length) == 0;
+}
+
+// paths come from the network, don't let them escape the folder
+static bool is_safe_path(const char* path, size_t length) {
+    if (length == 0) return false;
+    if (strcmp(path, CACHE_FILE_NAME) == 0 || ends_with(path, length, TEMP_SUFFIX)) return false;
+
+    size_t component_start = 0;
+    for (size_t i = 0; i <= length; i++) {
+        char c = i < length ? path[i] : '/';
+        if (c == '/') {
+            size_t component_length = i - component_start;
+            if (component_length == 0) return false; // leading or doubled slash
+            // ".", ".." and names Windows would trim
+            char last = path[i - 1];
+            if (last == '.' || last == ' ') return false;
+            component_start = i + 1;
+        } else if ((unsigned char)c < 32 || strchr("\\:*?\"<>|", c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// create missing folders in path after start
+static void create_directories(wchar_t* path, size_t start, bool include_last) {
+    for (size_t i = start; path[i] != L'\0'; i++) {
+        if (path[i] == L'\\') {
+            path[i] = L'\0';
+            CreateDirectoryW(path, NULL);
+            path[i] = L'\\';
+        }
+    }
+    if (include_last) CreateDirectoryW(path, NULL);
+}
+
+// OPEN_ALWAYS + truncate, CREATE_ALWAYS fails on hidden files
+static HANDLE create_output_file(wchar_t* path, size_t base_length) {
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (file == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND) {
+        // only create folders when missing
+        create_directories(path, base_length + 1, false);
+        file = CreateFileW(path, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    }
+    if (file != INVALID_HANDLE_VALUE && GetLastError() == ERROR_ALREADY_EXISTS && !SetEndOfFile(file)) {
+        DWORD error = GetLastError();
+        CloseHandle(file);
+        SetLastError(error);
+        return INVALID_HANDLE_VALUE;
+    }
+    return file;
+}
+
+typedef enum { RECEIVE_OK, RECEIVE_FAILED, RECEIVE_CONNECTION_LOST } ReceiveResult;
+
+// always reads the contents, even if they can't be written, so the stream stays in sync
+static ReceiveResult receive_file(Reader* reader, const wchar_t* base_dir, const char* path, uint16_t path_length,
+                                  uint64_t size, uint64_t modified_time, uint8_t* out_checksum, uint64_t* bytes_received) {
+    bool path_ok = is_safe_path(path, path_length);
+    if (!path_ok) printf("\nServer sent an unsafe path \"%s\", skipping it\n", path);
+
+    wchar_t* full_path = path_ok ? join_path(base_dir, path, path_length) : NULL;
+
+    // written in place, renaming a temp file is slow with Defender
+    // partial files are deleted, or resent next sync since their time won't match
+    HANDLE file = INVALID_HANDLE_VALUE;
+    if (full_path) {
+        file = create_output_file(full_path, wcslen(base_dir));
+        if (file == INVALID_HANDLE_VALUE) {
+            printf("\nFailed to create \"%s\" with code %lu\n", path, GetLastError());
+        } else if (size > SMALL_FILE_SIZE) {
+            // reduce fragmentation
+            FILE_ALLOCATION_INFO allocation = { .AllocationSize.QuadPart = (LONGLONG)size };
+            SetFileInformationByHandle(file, FileAllocationInfo, &allocation, sizeof(allocation));
+        }
+    }
+    bool write_ok = file != INVALID_HANDLE_VALUE;
+
+    // hash while receiving so the cache is updated without rereading
+    BCRYPT_HASH_HANDLE hash = NULL;
+    if (BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &hash, NULL, 0, NULL, 0, 0) != 0) hash = NULL;
+
+    ReceiveResult result = RECEIVE_OK;
+    uint64_t remaining = size;
+    while (remaining > 0) {
+        if (reader->start == reader->end && !fill_reader(reader)) {
+            result = RECEIVE_CONNECTION_LOST;
+            break;
+        }
+        size_t available = reader->end - reader->start;
+        DWORD n = (DWORD)(remaining < available ? remaining : available);
+        const uint8_t* data = reader->data + reader->start;
+
+        if (write_ok) {
+            DWORD written;
+            if (!WriteFile(file, data, n, &written, NULL) || written != n) {
+                printf("\nFailed to write \"%s\" with code %lu\n", path, GetLastError());
+                write_ok = false;
+            }
+        }
+        if (hash) BCryptHashData(hash, (PUCHAR)data, n, 0);
+
+        reader->start += n;
+        remaining -= n;
+        *bytes_received += n;
+    }
+
+    if (result == RECEIVE_OK && write_ok) {
+        // keep the server's modified time so the cache entry stays valid
+        FILETIME file_time = { .dwLowDateTime = (DWORD)modified_time, .dwHighDateTime = (DWORD)(modified_time >> 32) };
+        SetFileTime(file, NULL, NULL, &file_time);
+    }
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+        if (result != RECEIVE_OK || !write_ok) DeleteFileW(full_path);
+    }
+
+    if (hash) {
+        BCryptFinishHash(hash, out_checksum, HASH_SIZE, 0);
+        BCryptDestroyHash(hash);
+    } else {
+        memset(out_checksum, 0, HASH_SIZE);
+    }
+
+    free(full_path);
+    if (result == RECEIVE_OK && !write_ok) result = RECEIVE_FAILED;
+    return result;
+}
+
+static bool receive_files(SOCKET sock, const wchar_t* base_dir, Manifest* local) {
+    Reader reader = { .sock = sock, .data = malloc(NET_BUFFER_SIZE) };
+    char* path = malloc(UINT16_MAX + 1);
+    Manifest* added = create_manifest();
+    if (!reader.data || !path || !added) {
+        printf("Failed to allocate memory for receiving\n");
+        free(reader.data);
+        free(path);
+        free_manifest(added);
+        return false;
+    }
+
+    bool connected = true;
+    uint32_t expected_count = 0;
+    uint64_t expected_bytes = 0;
+    uint32_t written_count = 0;
+    uint32_t failed_count = 0;
+    uint64_t bytes_received = 0;
+    double start_time = now_seconds();
+
+    connected = read_exact(&reader, &expected_count, 4) && read_exact(&reader, &expected_bytes, 8);
+    if (connected) {
+        char size_text[32];
+        format_file_size(size_text, sizeof(size_text), (double)expected_bytes);
+        printf("Server is sending %u files (%s)\n", expected_count, size_text);
+    }
+
+    while (connected) {
+        uint8_t type;
+        if (!read_exact(&reader, &type, 1)) {
+            connected = false;
+            break;
+        }
+
+        if (type == MSG_END) {
+            uint32_t sent_count;
+            connected = read_exact(&reader, &sent_count, 4);
+            break;
+        }
+        if (type != MSG_FILE) {
+            printf("\nReceived unknown message type %u\n", type);
+            connected = false;
+            break;
+        }
+
+        uint64_t size, modified_time;
+        uint16_t path_length;
+        if (!read_exact(&reader, &size, 8) || !read_exact(&reader, &modified_time, 8)
+            || !read_exact(&reader, &path_length, 2) || !read_exact(&reader, path, path_length)) {
+            connected = false;
+            break;
+        }
+        path[path_length] = '\0';
+
+        uint8_t checksum[HASH_SIZE];
+        ReceiveResult result = receive_file(&reader, base_dir, path, path_length, size, modified_time, checksum, &bytes_received);
+        if (result == RECEIVE_CONNECTION_LOST) {
+            connected = false;
+            break;
+        }
+
+        if (result == RECEIVE_OK) {
+            written_count++;
+            ManifestFile* existing = find_record(local, path);
+            if (existing) {
+                existing->size = size;
+                existing->modified_time = modified_time;
+                memcpy(existing->checksum, checksum, HASH_SIZE);
+            } else {
+                add_record(added, size, modified_time, path, path_length, checksum);
+            }
+        } else {
+            failed_count++;
+        }
+
+        if (progress_due()) {
+            print_transfer_progress("Receiving", written_count + failed_count, expected_count, bytes_received, expected_bytes, start_time, path);
+        }
+    }
+
+    if (expected_count > 0) {
+        print_transfer_progress("Receiving", written_count + failed_count, expected_count, bytes_received, expected_bytes, start_time, "");
+        progress_end();
+    }
+
+    // added afterwards so find_record stays sorted
+    for (uint32_t i = 0; i < added->file_count; i++) {
+        ManifestFile* r = &added->records[i];
+        add_record(local, r->size, r->modified_time, r->path, r->path_length, r->checksum);
+    }
+    sort_manifest(local);
+    free_manifest(added);
+
+    if (connected) {
+        uint32_t results[2] = { written_count, failed_count };
+        connected = send_all(sock, results, sizeof(results));
+    }
+
+    char size_text[32];
+    format_file_size(size_text, sizeof(size_text), (double)bytes_received);
+    printf("Received %u files (%s) in %.2fs", written_count, size_text, now_seconds() - start_time);
+    if (failed_count > 0) printf(", %u failed", failed_count);
+    printf("\n");
+
+    free(reader.data);
+    free(path);
+    return connected && failed_count == 0;
+}
+
+static SOCKET connect_to_server(const char* address) {
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM, .ai_protocol = IPPROTO_TCP };
+    struct addrinfo* addresses;
+    int res = getaddrinfo(address, PORT_STRING, &hints, &addresses);
+    if (res != 0) {
+        printf("Couldn't resolve \"%s\" (code %d)\n", address, res);
+        return INVALID_SOCKET;
+    }
+
+    SOCKET sock = INVALID_SOCKET;
+    int last_error = 0;
+    for (struct addrinfo* a = addresses; a; a = a->ai_next) {
+        sock = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (sock == INVALID_SOCKET) {
+            last_error = WSAGetLastError();
+            continue;
+        }
+        if (connect(sock, a->ai_addr, (int)a->ai_addrlen) == 0) break;
+        last_error = WSAGetLastError();
+        closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
+    freeaddrinfo(addresses);
+
+    if (sock == INVALID_SOCKET) printf("Failed to connect to %s with code %d\n", address, last_error);
+    return sock;
+}
+
+static int run_client(const wchar_t* base_dir, const char* address) {
+    int result = EXIT_FAILURE;
+    Manifest* local_manifest = NULL;
+    uint8_t* encoded = NULL;
+
+    // create the destination, skipping the \\?\ prefix
+    wchar_t* base_copy = _wcsdup(base_dir);
+    if (base_copy) {
+        create_directories(base_copy, 4, true);
+        free(base_copy);
+    }
+    DWORD attributes = GetFileAttributesW(base_dir);
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        printf("Couldn't create the destination folder\n");
+        return EXIT_FAILURE;
+    }
+
+    SOCKET sock = connect_to_server(address);
+    if (sock == INVALID_SOCKET) return EXIT_FAILURE;
+    printf("Connected to server\n");
+
+    Manifest* cache = load_cache(base_dir);
+    local_manifest = scan_directory(base_dir, cache);
+    free_manifest(cache);
+    if (!local_manifest) {
+        printf("Failed to scan folder\n");
+        goto cleanup;
+    }
+
+    size_t encoded_size;
+    encoded = encode_manifest(local_manifest, &encoded_size);
+    if (!encoded) {
+        printf("Failed to allocate memory for manifest\n");
+        goto cleanup;
+    }
+    uint64_t manifest_size = encoded_size;
+    if (!send_all(sock, &manifest_size, sizeof(manifest_size)) || !send_all(sock, encoded, encoded_size)) goto cleanup;
+    free(encoded);
+    encoded = NULL;
+
+    if (receive_files(sock, base_dir, local_manifest)) result = EXIT_SUCCESS;
+
+    // save even on failure, received files are already hashed
+    if (!save_cache(base_dir, local_manifest)) {
+        printf("Warning: couldn't save the cache file, the next scan will hash everything again\n");
+    }
+    shutdown(sock, SD_SEND);
+
+cleanup:
+    closesocket(sock);
+    free(encoded);
+    free_manifest(local_manifest);
+    return result;
+}
+
+// ---- test ----
+
+// scan without the cache and check encoding round trips
+static int run_test(const wchar_t* base_dir) {
+    Manifest* m = scan_directory(base_dir, NULL);
+    if (!m) return EXIT_FAILURE;
+
+    size_t encoded_size;
+    uint8_t* encoded = encode_manifest(m, &encoded_size);
+    Manifest* decoded = encoded ? decode_manifest(encoded, encoded_size) : NULL;
+
+    bool matches = decoded && decoded->file_count == m->file_count;
+    for (uint32_t i = 0; matches && i < m->file_count; i++) {
+        ManifestFile* a = &m->records[i];
+        ManifestFile* b = &decoded->records[i];
+        matches = a->size == b->size && a->modified_time == b->modified_time
+            && a->path_length == b->path_length && strcmp(a->path, b->path) == 0
+            && memcmp(a->checksum, b->checksum, HASH_SIZE) == 0;
+    }
+
+    // truncated data must be rejected
+    bool rejects_truncated = !encoded || encoded_size <= 9 || decode_manifest(encoded, encoded_size - 1) == NULL;
+
+    printf("Manifest is %zu bytes, round trip %s, truncated data %s\n", encoded_size,
+           matches ? "OK" : "MISMATCH", rejects_truncated ? "rejected" : "ACCEPTED");
+
+    free(encoded);
+    free_manifest(decoded);
+    free_manifest(m);
+    return matches && rejects_truncated ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static void print_usage(const wchar_t* program) {
+    printf("usage:\n"
+           "  %ls PATH server          send PATH to a client\n"
+           "  %ls PATH sync ADDRESS    receive files from the server at ADDRESS into PATH\n"
+           "  %ls PATH test            hash PATH and check the manifest encoding\n",
+           program, program, program);
+}
+
+int wmain(int argc, wchar_t* argv[]) {
+    SetConsoleOutputCP(CP_UTF8);
+
+    if (argc < 3) {
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const wchar_t* command = argv[2];
+    wchar_t* base_dir = make_long_path(argv[1]);
+    if (!base_dir) {
+        printf("Invalid path\n");
+        return EXIT_FAILURE;
+    }
+
+    int result = EXIT_FAILURE;
+
+    if (wcscmp(command, L"test") == 0) {
+        result = run_test(base_dir);
+    } else if (wcscmp(command, L"server") == 0 || wcscmp(command, L"sync") == 0) {
+        WSADATA wsa_data;
+        int res = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+        if (res != 0) {
+            printf("WSAStartup failed with code %d\n", res);
+        } else if (wcscmp(command, L"server") == 0) {
+            result = run_server(base_dir);
+            WSACleanup();
+        } else if (argc < 4) {
+            print_usage(argv[0]);
+            WSACleanup();
+        } else {
+            char* address = wide_to_utf8(argv[3], -1, NULL);
+            if (address) result = run_client(base_dir, address);
+            free(address);
+            WSACleanup();
+        }
+    } else {
+        print_usage(argv[0]);
+    }
+
+    free(base_dir);
+    return result;
 }
