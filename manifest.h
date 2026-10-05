@@ -45,10 +45,11 @@ ManifestFile* find_record(const Manifest* m, const char* path);
 // scan a folder into a sorted manifest. unchanged files reuse hashes from cache, which can be NULL
 Manifest* scan_directory(const wchar_t* base_dir, const Manifest* cache);
 
-// NULL if missing or invalid
-Manifest* load_cache(const wchar_t* base_dir);
+// scan_directory using hashes from the cache file in base_dir
+Manifest* scan_with_cache(const wchar_t* base_dir);
 
-bool save_cache(const wchar_t* base_dir, const Manifest* m);
+// prints a warning on failure
+void save_cache(const wchar_t* base_dir, const Manifest* m);
 
 // file format (little endian)
 //  - "SYNC"     - 4 bytes

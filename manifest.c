@@ -100,11 +100,6 @@ static bool push_path(PathStack* stack, char* path) {
     return true;
 }
 
-static bool ends_with(const char* s, size_t length, const char* suffix) {
-    size_t suffix_length = strlen(suffix);
-    return length >= suffix_length && strcmp(s + length - suffix_length, suffix) == 0;
-}
-
 // list every file without hashing
 static bool list_files(const wchar_t* base_dir, Manifest* m) {
     PathStack stack = {0};
@@ -125,7 +120,7 @@ static bool list_files(const wchar_t* base_dir, Manifest* m) {
         size_t dir_length = dir ? wcslen(dir) : 0;
         wchar_t* search_path = dir ? malloc((dir_length + 3) * sizeof(wchar_t)) : NULL;
         if (!search_path) {
-            printf("\nOut of memory while listing files\n");
+            progress_message("Out of memory while listing files\n");
             free(dir);
             free(rel_dir);
             success = false;
@@ -139,7 +134,7 @@ static bool list_files(const wchar_t* base_dir, Manifest* m) {
         free(search_path);
 
         if (find_handle == INVALID_HANDLE_VALUE) {
-            printf("\nFailed to open folder \"%s\" with code %lu\n", is_root ? "." : rel_dir, GetLastError());
+            progress_message("Failed to open folder \"%s\" with code %lu\n", is_root ? "." : rel_dir, GetLastError());
             free(rel_dir);
             if (is_root) {
                 success = false;
@@ -155,7 +150,7 @@ static bool list_files(const wchar_t* base_dir, Manifest* m) {
             int name_length;
             char* name_utf8 = wide_to_utf8(name, -1, &name_length);
             if (!name_utf8) {
-                printf("\nSkipping file with invalid name in \"%s\"\n", is_root ? "." : rel_dir);
+                progress_message("Skipping file with invalid name in \"%s\"\n", is_root ? "." : rel_dir);
                 continue;
             }
 
@@ -177,7 +172,7 @@ static bool list_files(const wchar_t* base_dir, Manifest* m) {
             if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 // junctions can loop back up the tree
                 if (find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-                    printf("\nSkipping linked folder \"%s\"\n", path);
+                    progress_message("Skipping linked folder \"%s\"\n", path);
                     free(path);
                 } else if (!push_path(&stack, path)) {
                     free(path);
@@ -187,21 +182,16 @@ static bool list_files(const wchar_t* base_dir, Manifest* m) {
 
             bool skip = (is_root && strcmp(path, CACHE_FILE_NAME) == 0) || ends_with(path, path_length, TEMP_SUFFIX);
             if (path_length > UINT16_MAX) {
-                printf("\nSkipping file with path too long: \"%.100s...\"\n", path);
+                progress_message("Skipping file with path too long: \"%.100s...\"\n", path);
                 skip = true;
             }
 
             if (!skip) {
-                ULARGE_INTEGER file_size;
-                file_size.LowPart = find_data.nFileSizeLow;
-                file_size.HighPart = find_data.nFileSizeHigh;
+                uint64_t file_size = make_uint64(find_data.nFileSizeHigh, find_data.nFileSizeLow);
+                uint64_t file_time = make_uint64(find_data.ftLastWriteTime.dwHighDateTime, find_data.ftLastWriteTime.dwLowDateTime);
 
-                ULARGE_INTEGER file_time;
-                file_time.LowPart = find_data.ftLastWriteTime.dwLowDateTime;
-                file_time.HighPart = find_data.ftLastWriteTime.dwHighDateTime;
-
-                if (!add_record(m, file_size.QuadPart, file_time.QuadPart, path, (uint16_t)path_length, NULL)) {
-                    printf("\nOut of memory while listing files\n");
+                if (!add_record(m, file_size, file_time, path, (uint16_t)path_length, NULL)) {
+                    progress_message("Out of memory while listing files\n");
                     free(path);
                     success = false;
                     break;
@@ -230,8 +220,8 @@ static bool hash_file(const wchar_t* path, uint8_t* buffer, ManifestFile* r, vol
 
     BY_HANDLE_FILE_INFORMATION info;
     if (GetFileInformationByHandle(file, &info)) {
-        r->size = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
-        r->modified_time = ((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32) | info.ftLastWriteTime.dwLowDateTime;
+        r->size = make_uint64(info.nFileSizeHigh, info.nFileSizeLow);
+        r->modified_time = make_uint64(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
     }
 
     BCRYPT_HASH_HANDLE hash;
@@ -445,12 +435,9 @@ Manifest* scan_directory(const wchar_t* base_dir, const Manifest* cache) {
 
 // ---- cache file ----
 
-static wchar_t* cache_path(const wchar_t* base_dir, const char* name) {
-    return join_path(base_dir, name, -1);
-}
-
-Manifest* load_cache(const wchar_t* base_dir) {
-    wchar_t* path = cache_path(base_dir, CACHE_FILE_NAME);
+// NULL if missing or invalid
+static Manifest* load_cache(const wchar_t* base_dir) {
+    wchar_t* path = join_path(base_dir, CACHE_FILE_NAME, -1);
     if (!path) return NULL;
 
     HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
@@ -473,16 +460,21 @@ Manifest* load_cache(const wchar_t* base_dir) {
     return m;
 }
 
-bool save_cache(const wchar_t* base_dir, const Manifest* m) {
+Manifest* scan_with_cache(const wchar_t* base_dir) {
+    Manifest* cache = load_cache(base_dir);
+    Manifest* m = scan_directory(base_dir, cache);
+    free_manifest(cache);
+    return m;
+}
+
+void save_cache(const wchar_t* base_dir, const Manifest* m) {
     size_t encoded_size;
     uint8_t* encoded = encode_manifest(m, &encoded_size);
-    if (!encoded) return false;
-
-    wchar_t* path = cache_path(base_dir, CACHE_FILE_NAME);
-    wchar_t* temp_path = cache_path(base_dir, CACHE_FILE_NAME TEMP_SUFFIX);
+    wchar_t* path = join_path(base_dir, CACHE_FILE_NAME, -1);
+    wchar_t* temp_path = join_path(base_dir, CACHE_FILE_NAME TEMP_SUFFIX, -1);
     bool success = false;
 
-    if (path && temp_path) {
+    if (encoded && path && temp_path) {
         HANDLE file = CreateFileW(temp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
         if (file != INVALID_HANDLE_VALUE) {
             DWORD written;
@@ -497,10 +489,11 @@ bool save_cache(const wchar_t* base_dir, const Manifest* m) {
         }
     }
 
+    if (!success) printf("Warning: couldn't save the cache file, the next scan will hash everything again\n");
+
     free(path);
     free(temp_path);
     free(encoded);
-    return success;
 }
 
 // ---- encoding ----

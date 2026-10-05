@@ -56,10 +56,32 @@ void progress_print(const char* format, ...) {
     last_progress_length = length;
 }
 
-void progress_end(void) {
-    printf("\n");
+// move to a new line if a progress line is showing
+static void progress_break(void) {
+    if (last_progress_length > 0) printf("\n");
     last_progress_length = 0;
+}
+
+void progress_message(const char* format, ...) {
+    progress_break();
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+}
+
+void progress_end(void) {
+    progress_break();
     last_progress_time = 0;
+}
+
+bool ends_with(const char* s, size_t length, const char* suffix) {
+    size_t suffix_length = strlen(suffix);
+    return length >= suffix_length && memcmp(s + length - suffix_length, suffix, suffix_length) == 0;
+}
+
+uint64_t make_uint64(uint32_t high, uint32_t low) {
+    return ((uint64_t)high << 32) | low;
 }
 
 void utf8_truncate(char* out, size_t out_size, const char* in, size_t max_bytes) {

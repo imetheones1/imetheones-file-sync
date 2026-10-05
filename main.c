@@ -39,7 +39,7 @@ static bool send_all(SOCKET sock, const void* data, size_t size) {
         int chunk = size > INT_MAX ? INT_MAX : (int)size;
         int sent = send(sock, ptr, chunk, 0);
         if (sent == SOCKET_ERROR) {
-            printf("\nFailed to send data with code %d\n", WSAGetLastError());
+            progress_message("Failed to send data with code %d\n", WSAGetLastError());
             return false;
         }
         ptr += sent;
@@ -54,11 +54,11 @@ static bool recv_all(SOCKET sock, void* data, size_t size) {
         int chunk = size > INT_MAX ? INT_MAX : (int)size;
         int received = recv(sock, ptr, chunk, 0);
         if (received == 0) {
-            printf("\nConnection closed unexpectedly\n");
+            progress_message("Connection closed unexpectedly\n");
             return false;
         }
         if (received == SOCKET_ERROR) {
-            printf("\nFailed to receive data with code %d\n", WSAGetLastError());
+            progress_message("Failed to receive data with code %d\n", WSAGetLastError());
             return false;
         }
         ptr += received;
@@ -104,11 +104,11 @@ typedef struct Reader {
 static bool fill_reader(Reader* r) {
     int received = recv(r->sock, (char*)r->data, NET_BUFFER_SIZE, 0);
     if (received == 0) {
-        printf("\nConnection closed unexpectedly\n");
+        progress_message("Connection closed unexpectedly\n");
         return false;
     }
     if (received == SOCKET_ERROR) {
-        printf("\nFailed to receive data with code %d\n", WSAGetLastError());
+        progress_message("Failed to receive data with code %d\n", WSAGetLastError());
         return false;
     }
     r->start = 0;
@@ -141,11 +141,11 @@ static bool transmit_file(SOCKET sock, HANDLE file, uint64_t size) {
         LARGE_INTEGER position;
         position.QuadPart = offset;
         if (!SetFilePointerEx(file, position, NULL, FILE_BEGIN)) {
-            printf("\nFailed to seek file with code %lu\n", GetLastError());
+            progress_message("Failed to seek file with code %lu\n", GetLastError());
             return false;
         }
         if (!TransmitFile(sock, file, chunk, 0, NULL, NULL, 0)) {
-            printf("\nTransmitFile failed with code %d\n", WSAGetLastError());
+            progress_message("TransmitFile failed with code %d\n", WSAGetLastError());
             return false;
         }
         offset += chunk;
@@ -214,13 +214,13 @@ static bool send_files(SOCKET sock, const wchar_t* base_dir, const Manifest* loc
 
         BY_HANDLE_FILE_INFORMATION info;
         if (file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file, &info)) {
-            printf("\nFailed to open \"%s\" with code %lu, skipping it\n", r->path, GetLastError());
+            progress_message("Failed to open \"%s\" with code %lu, skipping it\n", r->path, GetLastError());
             if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
             continue;
         }
 
-        uint64_t size = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
-        uint64_t modified_time = ((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32) | info.ftLastWriteTime.dwLowDateTime;
+        uint64_t size = make_uint64(info.nFileSizeHigh, info.nFileSizeLow);
+        uint64_t modified_time = make_uint64(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime);
 
         uint8_t type = MSG_FILE;
         success = append_buffer(&buffer, &type, 1)
@@ -234,7 +234,7 @@ static bool send_files(SOCKET sock, const wchar_t* base_dir, const Manifest* loc
                 success = reserve_buffer(&buffer, (size_t)size);
                 if (success && !read_file_exact(file, buffer.data + buffer.used, (size_t)size)) {
                     // header is already queued, can't skip this file
-                    printf("\nFailed to read \"%s\" with code %lu\n", r->path, GetLastError());
+                    progress_message("Failed to read \"%s\" with code %lu\n", r->path, GetLastError());
                     success = false;
                 }
                 buffer.used += (size_t)size;
@@ -259,7 +259,7 @@ static bool send_files(SOCKET sock, const wchar_t* base_dir, const Manifest* loc
             && append_buffer(&buffer, &sent_count, 4)
             && flush_buffer(&buffer);
     }
-    if (send_count > 0) progress_end();
+    progress_end();
 
     uint32_t client_results[2]; // written, failed
     if (success && recv_all(sock, client_results, sizeof(client_results))) {
@@ -333,16 +333,12 @@ static int run_server(const wchar_t* base_dir) {
     }
     printf("Client connected from %s\n", host);
 
-    Manifest* cache = load_cache(base_dir);
-    local_manifest = scan_directory(base_dir, cache);
-    free_manifest(cache);
+    local_manifest = scan_with_cache(base_dir);
     if (!local_manifest) {
         printf("Failed to scan folder\n");
         goto cleanup;
     }
-    if (!save_cache(base_dir, local_manifest)) {
-        printf("Warning: couldn't save the cache file, the next scan will hash everything again\n");
-    }
+    save_cache(base_dir, local_manifest);
 
     uint64_t manifest_size;
     if (!recv_all(client_socket, &manifest_size, sizeof(manifest_size))) goto cleanup;
@@ -380,11 +376,6 @@ cleanup:
 }
 
 // ---- client ----
-
-static bool ends_with(const char* s, size_t length, const char* suffix) {
-    size_t suffix_length = strlen(suffix);
-    return length >= suffix_length && memcmp(s + length - suffix_length, suffix, suffix_length) == 0;
-}
 
 // paths come from the network, don't let them escape the folder
 static bool is_safe_path(const char* path, size_t length) {
@@ -443,7 +434,7 @@ typedef enum { RECEIVE_OK, RECEIVE_FAILED, RECEIVE_CONNECTION_LOST } ReceiveResu
 static ReceiveResult receive_file(Reader* reader, const wchar_t* base_dir, const char* path, uint16_t path_length,
                                   uint64_t size, uint64_t modified_time, uint8_t* out_checksum, uint64_t* bytes_received) {
     bool path_ok = is_safe_path(path, path_length);
-    if (!path_ok) printf("\nServer sent an unsafe path \"%s\", skipping it\n", path);
+    if (!path_ok) progress_message("Server sent an unsafe path \"%s\", skipping it\n", path);
 
     wchar_t* full_path = path_ok ? join_path(base_dir, path, path_length) : NULL;
 
@@ -453,7 +444,7 @@ static ReceiveResult receive_file(Reader* reader, const wchar_t* base_dir, const
     if (full_path) {
         file = create_output_file(full_path, wcslen(base_dir));
         if (file == INVALID_HANDLE_VALUE) {
-            printf("\nFailed to create \"%s\" with code %lu\n", path, GetLastError());
+            progress_message("Failed to create \"%s\" with code %lu\n", path, GetLastError());
         } else if (size > SMALL_FILE_SIZE) {
             // reduce fragmentation
             FILE_ALLOCATION_INFO allocation = { .AllocationSize.QuadPart = (LONGLONG)size };
@@ -480,7 +471,7 @@ static ReceiveResult receive_file(Reader* reader, const wchar_t* base_dir, const
         if (write_ok) {
             DWORD written;
             if (!WriteFile(file, data, n, &written, NULL) || written != n) {
-                printf("\nFailed to write \"%s\" with code %lu\n", path, GetLastError());
+                progress_message("Failed to write \"%s\" with code %lu\n", path, GetLastError());
                 write_ok = false;
             }
         }
@@ -553,7 +544,7 @@ static bool receive_files(SOCKET sock, const wchar_t* base_dir, Manifest* local)
             break;
         }
         if (type != MSG_FILE) {
-            printf("\nReceived unknown message type %u\n", type);
+            progress_message("Received unknown message type %u\n", type);
             connected = false;
             break;
         }
@@ -671,9 +662,7 @@ static int run_client(const wchar_t* base_dir, const char* address) {
     if (sock == INVALID_SOCKET) return EXIT_FAILURE;
     printf("Connected to server\n");
 
-    Manifest* cache = load_cache(base_dir);
-    local_manifest = scan_directory(base_dir, cache);
-    free_manifest(cache);
+    local_manifest = scan_with_cache(base_dir);
     if (!local_manifest) {
         printf("Failed to scan folder\n");
         goto cleanup;
@@ -693,9 +682,7 @@ static int run_client(const wchar_t* base_dir, const char* address) {
     if (receive_files(sock, base_dir, local_manifest)) result = EXIT_SUCCESS;
 
     // save even on failure, received files are already hashed
-    if (!save_cache(base_dir, local_manifest)) {
-        printf("Warning: couldn't save the cache file, the next scan will hash everything again\n");
-    }
+    save_cache(base_dir, local_manifest);
     shutdown(sock, SD_SEND);
 
 cleanup:
